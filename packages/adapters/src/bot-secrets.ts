@@ -126,6 +126,7 @@ export async function loadBotCommandEnvironment(
   secretStore: Pick<SecretStore, "load">,
   scope: BotSecretScope,
   unsetVariables?: Set<string>,
+  authorize?: (credentialName: string) => Promise<boolean>,
 ): Promise<Record<string, string>> {
   const rows = await prisma.botSecret.findMany({
     where: scopeFields(scope),
@@ -138,6 +139,10 @@ export async function loadBotCommandEnvironment(
     if (!isCommandCredential(row.auth)) continue;
     const variable = commandVariableName(row.name);
     if (commandVariableProblem(variable)) continue;
+    if (authorize && !(await authorize(row.name))) {
+      unsetVariables?.add(variable);
+      continue;
+    }
     let value: string;
     try {
       value = await secretStore.load(row.ciphertext, row.id);
@@ -162,6 +167,7 @@ export async function shellCommandEnvironment(input: {
   scope: BotSecretScope;
   spaceEnvironment: Record<string, string>;
   registerRedactions: (values: string[]) => void;
+  authorize?: (credentialName: string) => Promise<boolean>;
 }): Promise<{ env: Record<string, string>; unsetEnv: string[] }> {
   const unsetVariables = new Set<string>();
   const botEnvironment = await loadBotCommandEnvironment(
@@ -169,6 +175,7 @@ export async function shellCommandEnvironment(input: {
     input.secretStore,
     input.scope,
     unsetVariables,
+    input.authorize,
   );
   // Encoded forms too, as secret_request does, so an accidental `base64` or URL-encoding of a
   // value is still redacted from command output.
@@ -497,6 +504,7 @@ export async function requestWithBotSecret(input: {
   signal: AbortSignal;
   remote?: RemoteTransportDependencies;
   registerRedactions?: (values: string[]) => void;
+  authorize?: (credentialName: string) => Promise<boolean>;
 }): Promise<unknown> {
   const request = SecretHttpRequest.parse(input.request);
   const row = await input.prisma.botSecret.findFirst({
@@ -515,6 +523,9 @@ export async function requestWithBotSecret(input: {
   const url = new URL(request.url);
   if (url.origin !== destination.origin || url.username || url.password || url.hash) {
     return { error: "This credential cannot be sent to that destination." };
+  }
+  if (input.authorize && !(await input.authorize(request.name))) {
+    return { error: "Credential is unavailable. Use request_secret to save it first." };
   }
   const controller = new AbortController();
   const signal = combineSignals(input.signal, controller.signal, AbortSignal.timeout(30_000));
@@ -595,6 +606,7 @@ export async function resolveLoginFill(input: {
   scope: BotSecretScope;
   name: string;
   field: LoginField;
+  authorize?: (credentialName: string) => Promise<boolean>;
 }): Promise<{ text: string; origin: string; redactions: string[] } | { error: string }> {
   const row = await input.prisma.botSecret.findFirst({
     where: { ...scopeFields(input.scope), name: input.name },
@@ -621,6 +633,9 @@ export async function resolveLoginFill(input: {
   }
   if (destination.origin !== storedOrigin.origin) {
     return { error: "Website logins can only be filled on an HTTPS origin." };
+  }
+  if (input.authorize && !(await input.authorize(input.name))) {
+    return { error: "Login is unavailable. Use request_secret to save it first." };
   }
   const login = decodeLoginSecret(await input.secretStore.load(row.ciphertext, row.id));
   return {

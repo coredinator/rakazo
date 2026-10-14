@@ -117,6 +117,7 @@ import {
   SpaceLimitError,
   searchHistory,
 } from "@rakazo/db";
+import type { Kiln } from "@rakazo/kiln";
 import { getLogger } from "@rakazo/logging";
 import { parse as parseShellCommand } from "shell-quote";
 import {
@@ -249,6 +250,14 @@ import {
   selectCompactedHistory,
   shouldEnqueueCompaction,
 } from "./history-compaction.js";
+import {
+  authorizeCredential,
+  beginKilnRun,
+  emitKilnMount,
+  hostKiln,
+  RUN_SECRET_CREDENTIAL_NAME,
+  runWorkspaceMount,
+} from "./kiln-host.js";
 import {
   assertConnectorToolArgs,
   CATALOG_EXECUTE,
@@ -2678,6 +2687,8 @@ export interface ExecutorDeps {
   codexCatalog?: CodexLiveCatalog;
   /** Aborted when createApp stop() begins so in-flight continueRun boot waits exit promptly. */
   shutdownSignal?: AbortSignal;
+  /** Coordinator. Absent uses the allow-all logging stub. */
+  kiln?: Kiln;
 }
 
 function isAuditableToolResult(value: unknown): value is {
@@ -3351,6 +3362,12 @@ export function createRunExecutor(deps: ExecutorDeps) {
 
       const runSecrets = [...deps.secrets];
       try {
+        const kiln = deps.kiln ?? hostKiln();
+        const kilnGrant = await beginKilnRun(kiln, {
+          engagementId: run.threadId,
+          agentId: run.botId,
+        });
+        const allowCredential = (name: string) => authorizeCredential(kiln, kilnGrant, runId, name);
         const sourceBlocks =
           run.trigger === "messaging" && run.sourceMessageId
             ? ((
@@ -3417,7 +3434,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               secret: { select: { id: true, ciphertext: true } },
             },
           }),
-          loadBotCommandEnvironment(deps.prisma, deps.secretStore, run),
+          loadBotCommandEnvironment(deps.prisma, deps.secretStore, run, undefined, allowCredential),
         ]);
         const historySearchBeforeSeq =
           contextStrategy !== "current" && run.sourceMessageId
@@ -3430,7 +3447,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
               )?.seq ??
               thread.nextMessageSeq)
             : thread.nextMessageSeq;
-        const agentEnvironment = await decryptAgentEnvironment(agentSecretRows, deps.secretStore);
+        const agentEnvironment = await decryptAgentEnvironment(
+          agentSecretRows,
+          deps.secretStore,
+          allowCredential,
+        );
         runSecrets.push(...Object.values(agentEnvironment));
         // Encoded forms too: read_file redacts with these values before any shell command runs.
         runSecrets.push(...commandCredentialRedactions(initialBotCommandEnvironment));
@@ -3897,6 +3918,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
           computerMode === "team"
             ? `Your Team Computer home is ${teamBotWorkspaceDirectory(bot.id)}. Relative file paths and shell working directories start there. Put intentionally shared work under shared/. Other bots' folders are visible under bots/; treat them as their working areas.`
             : "This entire computer workspace is your private home. Relative file paths and shell working directories start at its root.";
+        await emitKilnMount(kiln, runId, runWorkspaceMount(computerMode, bot.id));
 
         let assembled = "";
         let currentTextSegment = "";
@@ -4945,6 +4967,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
               scope: run,
               spaceEnvironment: agentEnvironment,
               registerRedactions: registerRunSecrets,
+              authorize: allowCredential,
             });
             workspaceCheckpoint.markDirty();
             const commandEvent = {
@@ -5220,6 +5243,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                         scope: run,
                         name: step.secret,
                         field: step.field,
+                        authorize: allowCredential,
                       });
                       if ("error" in resolved) return resolved;
                       registerRunSecrets(resolved.redactions);
@@ -5755,6 +5779,7 @@ export function createRunExecutor(deps: ExecutorDeps) {
                 signal: context.signal,
                 remote: deps.secretHttp,
                 registerRedactions: registerRunSecrets,
+                authorize: allowCredential,
               });
               return finish(result);
             } catch {
@@ -5818,6 +5843,11 @@ export function createRunExecutor(deps: ExecutorDeps) {
               },
             });
             if (storedSecret) {
+              if (!(await allowCredential(RUN_SECRET_CREDENTIAL_NAME))) {
+                return finish({
+                  error: "Credential is unavailable. Use request_secret to save it first.",
+                });
+              }
               const plaintext = await deps.secretStore.load(
                 storedSecret.ciphertext,
                 storedSecret.id,
@@ -6492,6 +6522,8 @@ export function createRunExecutor(deps: ExecutorDeps) {
               botId: bot.id,
               threadId: thread.id,
               runId,
+              kiln,
+              kilnGrant,
               sourceMessageId: run.sourceMessageId,
               onUsage: async (event) => {
                 await recordUsage(deps.prisma, event, {

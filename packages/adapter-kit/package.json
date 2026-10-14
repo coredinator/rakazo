@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@rakazo/contracts": "workspace:*",
+    "@rakazo/kiln": "workspace:*",
     "zod": "4.6.2"
   },
   "devDependencies": {

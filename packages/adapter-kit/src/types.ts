@@ -3,6 +3,7 @@ import type {
   ConnectionCatalogItem,
   SandboxKind,
 } from "@rakazo/contracts";
+import type { Kiln, KilnGrant } from "@rakazo/kiln";
 
 export interface AdapterContext {
   operationId: string;
@@ -450,6 +451,10 @@ export interface AgentRunRequest {
   botId: string;
   threadId: string;
   runId: string;
+  /** Coordinator for this run. Absent calls use the host allow-all stub. */
+  kiln?: Kiln;
+  /** Grant returned by run.start. Spawn proposes the child grant from it. */
+  kilnGrant?: KilnGrant;
   sourceMessageId?: string | null;
   prompt: string;
   instructions: string;

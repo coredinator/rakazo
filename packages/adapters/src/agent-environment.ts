@@ -10,15 +10,16 @@ type EncryptedAgentSecret = {
 export async function decryptAgentEnvironment(
   rows: EncryptedAgentSecret[],
   secrets: Pick<SecretStore, "load">,
+  authorize?: (credentialName: string) => Promise<boolean>,
 ): Promise<Record<string, string>> {
-  return Object.fromEntries(
-    await Promise.all(
-      rows.map(async (row) => {
-        AgentSecretInputSchema.shape.name.parse(row.name);
-        return [row.name, await secrets.load(row.secret.ciphertext, row.secret.id)];
-      }),
-    ),
+  const entries = await Promise.all(
+    rows.map(async (row) => {
+      AgentSecretInputSchema.shape.name.parse(row.name);
+      if (authorize && !(await authorize(row.name))) return undefined;
+      return [row.name, await secrets.load(row.secret.ciphertext, row.secret.id)] as const;
+    }),
   );
+  return Object.fromEntries(entries.filter((entry) => entry !== undefined));
 }
 
 export function formatAgentEnvironmentInstruction(

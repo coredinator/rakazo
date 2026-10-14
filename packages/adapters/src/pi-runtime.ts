@@ -31,6 +31,7 @@ import type {
 import { DEFAULT_CONTEXT_STRATEGY } from "@rakazo/adapter-kit";
 import { usableModelId } from "@rakazo/contracts";
 import { abortableDelay } from "@rakazo/core";
+import type { KilnGrant } from "@rakazo/kiln";
 import { getLogger } from "@rakazo/logging";
 import { isToolPauseResult } from "./approval-effect.js";
 import { connectionIdArgument, credentialArgument } from "./bot-secrets.js";
@@ -38,6 +39,12 @@ import { DELEGATION_TOOL_NAMES } from "./builtin-tools.js";
 import { withCloudflareGatewayAuth } from "./cloudflare-ai-gateway.js";
 import { shortenToolResultText } from "./context-selection.js";
 import { DEFAULT_OPENROUTER_MODEL_ID } from "./deployment-model.js";
+import {
+  filterToolsByGrant,
+  hostKiln,
+  proposeChildGrant,
+  resolveGrantedModel,
+} from "./kiln-host.js";
 import { estimateModelContextTokens } from "./model-context.js";
 import { IMAGE_RETURNING_COMPUTER_TOOLS } from "./model-vision.js";
 import {
@@ -1317,6 +1324,8 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
   const requestedModelId = String(args.model_id ?? "").trim();
   const hasBackups = Boolean(host.request.fallbackModels?.length);
   let requestModel = hasBackups ? host.activeModel.config : host.request.model;
+  let childTools = host.request.tools.filter((tool) => !DELEGATION_TOOL_NAMES.has(tool.name));
+  let childGrant: KilnGrant | undefined = host.request.kilnGrant;
   try {
     if (Boolean(requestedProvider) !== Boolean(requestedModelId)) {
       throw new Error("model_provider and model_id must both be set");
@@ -1327,6 +1336,27 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
       }
       requestModel = await host.request.resolveModel(requestedProvider, requestedModelId);
     }
+    const kiln = host.request.kiln ?? hostKiln();
+    const checked = await kiln["spawn.check"]({
+      parent_run_id: host.request.runId,
+      child_task: task,
+      proposed_grant: proposeChildGrant({
+        parent: host.request.kilnGrant,
+        toolNames: childTools.map((tool) => tool.name),
+        provider: requestModel.provider,
+        modelId: requestModel.id,
+      }),
+    });
+    if (checked.decision === "deny") {
+      throw new Error(checked.reason || "spawn denied");
+    }
+    childGrant = checked.grant;
+    childTools = filterToolsByGrant(childTools, checked.grant);
+    requestModel = await resolveGrantedModel(
+      checked.grant,
+      requestModel,
+      host.request.resolveModel,
+    );
   } catch (error) {
     const message = sanitizeError(error instanceof Error ? error.message : String(error));
     host.queue.push({
@@ -1364,9 +1394,14 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
   }
   const subagentModel = modelForCompletion(selectedModel.model, requestModel.maxTokens);
 
-  const childDefs = host.request.tools.filter((tool) => !DELEGATION_TOOL_NAMES.has(tool.name));
   const nestedHost: ToolHost = {
     ...host,
+    request: {
+      ...host.request,
+      model: requestModel,
+      tools: childTools,
+      kilnGrant: childGrant,
+    },
     activeModel: {
       config: requestModel,
       models: selectedModel.models,
@@ -1479,7 +1514,7 @@ async function executeSubagent(host: ToolHost, executionId: string, args: Record
         .join(" "),
       model: subagentModel,
       thinkingLevel: thinkingLevelFor(subagentModel, requestModel.thinkingLevel),
-      tools: toAgentTools(childDefs, nestedHost),
+      tools: toAgentTools(childTools, nestedHost),
       messages: [],
     },
   });

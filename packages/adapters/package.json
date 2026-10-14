@@ -27,6 +27,7 @@
     "@rakazo/adapter-kit": "workspace:*",
     "@rakazo/contracts": "workspace:*",
     "@rakazo/core": "workspace:*",
+    "@rakazo/kiln": "workspace:*",
     "@rakazo/db": "workspace:*",
     "@rakazo/logging": "workspace:*",
     "chat": "4.40.0",
